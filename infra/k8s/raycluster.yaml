@@ -1,0 +1,184 @@
+# KubeRay RayCluster for the ML platform (example; not needed for the
+# local demo). Requires the KubeRay operator (helm install kuberay-operator
+# kuberay/kuberay-operator) and, for the GPU group, the NVIDIA device plugin /
+# GPU operator on the GPU node pool.
+#
+#   kubectl create namespace ml
+#   kubectl -n ml apply -f infra/k8s/raycluster.yaml
+#
+# The image is infra/docker/Dockerfile pushed to your registry. Dagster (see
+# dagster-values.yaml) connects with RAY_ADDRESS=ray://ml-ray-head-svc.ml.svc:10001.
+---
+# Shared, persistent storage for rounds (data/), reports/ and checkpoints
+# (artifacts/). Ray Train workers on different nodes must all see the same
+# paths, so this must be ReadWriteMany (EFS / Filestore / Azure Files / CephFS).
+# Object storage is the preferred production alternative: point Ray Train's
+# RunConfig(storage_path="s3://bucket/ray-results") and MLflow's
+# --artifacts-destination at a bucket, and keep this PVC only for scratch.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ml-shared
+  namespace: ml
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: rwx-shared   # e.g. efs-sc, standard-rwx, azurefile-csi
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ml-ray
+  namespace: ml
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  rayVersion: "2.58.0"   # must match the ray version in uv.lock / the image
+  # KubeRay's in-tree autoscaler sidecar scales worker groups between
+  # minReplicas and maxReplicas from pending Ray resource demand (e.g. a
+  # TorchTrainer asking for 4 GPU workers). Pair with the cloud's node
+  # autoscaler (Cluster Autoscaler / Karpenter / GKE NAP) so new pods get nodes.
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 120      # scale idle GPU workers down quickly (cost)
+    resources:
+      requests: {cpu: 200m, memory: 256Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+
+  # ----------------------------------------------------------------- head
+  # The head runs GCS, dashboard, Ray client server and the Serve controller.
+  # num-cpus: 0 keeps training/eval tasks off the head (scheduled on workers).
+  headGroupSpec:
+    serviceType: ClusterIP
+    rayStartParams:
+      num-cpus: "0"
+      dashboard-host: "0.0.0.0"
+      metrics-export-port: "8080"
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/component: ray-head
+      spec:
+        # Head must be on stable (on-demand) capacity: losing it loses the
+        # cluster (unless GCS fault tolerance with external Redis is enabled).
+        nodeSelector:
+          ml.io/pool: system
+        containers:
+          - name: ray-head
+            image: ghcr.io/your-org/ml-platform:0.1.0
+            imagePullPolicy: IfNotPresent
+            env: &common-env
+              - {name: ML_CONFIG, value: configs/distributed.yaml}
+              - {name: MLFLOW_TRACKING_URI, value: "http://mlflow.ml.svc:5000"}
+              - {name: RAY_SERVE_DEFAULT_HTTP_HOST, value: "0.0.0.0"}
+            ports:
+              - {containerPort: 6379, name: gcs-server}
+              - {containerPort: 8265, name: dashboard}
+              - {containerPort: 10001, name: client}
+              - {containerPort: 8000, name: serve}
+              - {containerPort: 8080, name: metrics}   # Prometheus scrape target
+            resources:
+              requests: {cpu: "2", memory: 8Gi}
+              limits: {cpu: "2", memory: 8Gi}
+            volumeMounts: &common-mounts
+              - {name: shared, mountPath: /app/data, subPath: data}
+              - {name: shared, mountPath: /app/reports, subPath: reports}
+              - {name: shared, mountPath: /app/artifacts, subPath: artifacts}
+              - {name: dshm, mountPath: /dev/shm}
+        volumes: &common-volumes
+          - name: shared
+            persistentVolumeClaim:
+              claimName: ml-shared
+          - name: dshm          # Ray object store + DataLoader shared memory
+            emptyDir:
+              medium: Memory
+              sizeLimit: 4Gi
+
+  workerGroupSpecs:
+    # --------------------------------------------------------- CPU workers
+    # Data prep, bootstrap/eval tasks, CPU Serve replicas, CPU DDP.
+    - groupName: cpu
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 10
+      rayStartParams:
+        metrics-export-port: "8080"
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/component: ray-worker-cpu
+        spec:
+          nodeSelector:
+            ml.io/pool: cpu
+          # CPU work is retry-safe (Ray task retries, Ray Train restores from
+          # the last checkpoint), so it may run on spot/preemptible nodes.
+          # Prefer spot, fall back to on-demand:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      # GKE: cloud.google.com/gke-spot=true
+                      # EKS (Karpenter): karpenter.sh/capacity-type=spot
+                      - {key: karpenter.sh/capacity-type, operator: In, values: [spot]}
+          tolerations:
+            - {key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}
+          containers:
+            - name: ray-worker
+              image: ghcr.io/your-org/ml-platform:0.1.0
+              imagePullPolicy: IfNotPresent
+              env: *common-env
+              ports:
+                - {containerPort: 8080, name: metrics}
+              # Ray derives num-cpus / memory from these; requests == limits
+              # gives Guaranteed QoS so Ray's view matches the kernel's.
+              resources:
+                requests: {cpu: "4", memory: 16Gi}
+                limits: {cpu: "4", memory: 16Gi}
+              volumeMounts: *common-mounts
+          volumes: *common-volumes
+
+    # --------------------------------------------------------- GPU workers
+    # Ray Train DDP workers (use_gpu) and GPU Serve replicas.
+    # minReplicas: 0 -> no GPU nodes are billed while idle.
+    - groupName: gpu
+      replicas: 0
+      minReplicas: 0
+      maxReplicas: 4
+      rayStartParams:
+        metrics-export-port: "8080"
+        # num-gpus is auto-detected from the nvidia.com/gpu limit.
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/component: ray-worker-gpu
+        spec:
+          # Pin to the GPU node pool (GKE: cloud.google.com/gke-accelerator:
+          # nvidia-l4; EKS: node.kubernetes.io/instance-type or a Karpenter
+          # NodePool label).
+          nodeSelector:
+            ml.io/pool: gpu
+          # GPU pools are tainted so only GPU workloads land there.
+          tolerations:
+            - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+            # Uncomment to allow preemptible GPU capacity. Safe for training
+            # because checkpoints go to shared storage every epoch and Ray
+            # Train FailureConfig(max_failures>0) resumes from the latest one;
+            # keep Serve's GPU replicas on on-demand nodes.
+            # - {key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}
+          containers:
+            - name: ray-worker
+              image: ghcr.io/your-org/ml-platform:0.1.0
+              imagePullPolicy: IfNotPresent
+              env: *common-env
+              ports:
+                - {containerPort: 8080, name: metrics}
+              resources:
+                requests: {cpu: "8", memory: 32Gi, nvidia.com/gpu: 1}
+                limits: {cpu: "8", memory: 32Gi, nvidia.com/gpu: 1}
+              volumeMounts: *common-mounts
+          volumes: *common-volumes

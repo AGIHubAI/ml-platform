@@ -1,0 +1,50 @@
+# Dagster instance config for the Docker Compose stack.
+# Lives in $DAGSTER_HOME (/opt/dagster/dagster_home, baked into the image).
+# Durable state lives on the `dagster_storage` volume at /opt/dagster/storage,
+# which is shared by dagster-webserver and dagster-daemon.
+#
+# Production: replace the sqlite storage block with Postgres so the webserver,
+# daemon and run workers do not contend on SQLite file locks:
+#
+#   storage:
+#     postgres:
+#       postgres_db:
+#         hostname: {env: DAGSTER_PG_HOST}
+#         username: {env: DAGSTER_PG_USER}
+#         password: {env: DAGSTER_PG_PASSWORD}
+#         db_name:  {env: DAGSTER_PG_DB}
+#         port: 5432
+#
+# and move compute logs to object storage (dagster_aws.s3.compute_log_manager.
+# S3ComputeLogManager / dagster_gcp GCSComputeLogManager).
+
+storage:
+  sqlite:
+    base_dir: /opt/dagster/storage
+
+local_artifact_storage:
+  module: dagster.core.storage.root
+  class: LocalArtifactStorage
+  config:
+    base_dir: /opt/dagster/storage
+
+compute_logs:
+  module: dagster.core.storage.local_compute_log_manager
+  class: LocalComputeLogManager
+  config:
+    base_dir: /opt/dagster/storage/compute_logs
+
+# Runs are enqueued by the webserver/sensors and dequeued by the daemon. The
+# default run launcher executes each run in a subprocess of the daemon's code
+# location; the expensive work inside a run is shipped to Ray (RAY_ADDRESS).
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 2
+
+run_monitoring:
+  enabled: true
+
+telemetry:
+  enabled: false

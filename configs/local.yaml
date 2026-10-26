@@ -1,0 +1,127 @@
+# Demo defaults (see docs/PLAN.md "Config"). Runs in seconds on a laptop CPU.
+# Select another file with ML_CONFIG=configs/distributed.yaml (or `distributed`).
+seed: 0
+
+paths:
+  data_dir: data
+  reports_dir: reports
+  artifacts_dir: artifacts
+
+data:
+  n_features: 32
+  pool_size: 100000
+  initial_observations: 500
+  batch_size_per_round: 100
+  pool_seed: 0
+
+model:
+  hidden_dims: [256, 256, 128]
+  dropout: 0.1
+
+training:
+  epochs: 30
+  batch_size: 64            # per worker; global batch = batch_size * num_workers under DDP
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  val_fraction: 0.2
+  val_strategy: hash        # stable per-experiment split (fair cross-round comparison);
+                            # or newest_round (prospective hold-out) / random
+  deterministic: true
+  checkpoint_every: 1
+  loss: mse                 # or gaussian_nll (adds a variance head)
+  device: auto              # auto -> cuda if available else cpu (mps only if explicit)
+
+distributed:
+  num_workers: 2
+  use_gpu: auto
+  cpus_per_worker: 1
+
+evaluation:
+  max_rmse: 0.35            # on standardized responses
+  min_improvement_vs_baseline: 0.02
+  bootstrap_samples: 1000
+  mc_samples: 30
+
+active_learning:
+  beta: 1.0
+  max_cost: null
+  feature_bounds: [-3.0, 3.0]
+
+tracking:
+  tracking_uri: "sqlite:///mlflow.db"
+  experiment: ml-closed-loop
+  registered_model: ml-surrogate
+
+serve:
+  num_replicas: 1
+  max_batch_size: 64
+  batch_wait_timeout_s: 0.01
+  port: 8000
+
+# fUSI real-time workload (src/ml_platform/workloads/fusi_realtime, README "fUSI").
+# Hashed separately from the closed loop (FusiConfig.config_hash).
+fusi:
+  sim:
+    grid: [32, 32, 32]        # real-time benchmark volume; 64^3 / 128^3 also valid
+    frame_rate_hz: 10.0
+    n_ensemble: 8             # compound frames per volume (SVD clutter filter input)
+    signal_mode: hemodynamic  # or reporter (fast kinetics, reporter_tau_s is an assumption)
+    reporter_tau_s: 0.2
+    signal_gain: 0.2
+    seed: 0
+  sessions:
+    sessions_per_subject: 12
+    session_s: 90.0
+    grid: [16, 16, 16]        # batch pipeline volumes (keeps Zarr stores ~15 MB/session)
+    store: doppler            # or iq (~16x larger; the Dask job then runs the clutter filter)
+  preprocess:
+    clutter_rank: 1
+    drift_tau_s: 20.0
+    retroicor_order: 2
+  split:
+    hold_out: session         # or subject / time_block
+    gap_s: 10.0
+    window_frames: 24
+    max_test_accesses: 5
+    max_train_test_gap: 0.35
+  decoder:
+    kind: transformer         # or pca_lda
+    patch: 8
+    d_model: 32
+    n_layers: 2
+    attn_window: 24
+  training:
+    epochs: 8
+    num_workers: 2            # Ray Train DDP world size
+    strategy: ddp             # or fsdp2
+  realtime:
+    seconds: 20.0
+    late_ms: 100.0
+    max_in_flight: 3
+    torch_threads: 2
+  telemetry:
+    exporter: none            # or console / file / otlp
+  serve:
+    num_replicas: 2
+  gates:
+    p99_budget_ms: 130.0      # Golub, Yu, Chase, EMBC 2012: ~130 ms feedback delay, one monkey
+    stage_budget_ms: 80.0
+    max_drop_fraction: 0.0
+  tracking:
+    experiment: ml-fusi-realtime
+    registered_model: ml-fusi-decoder
+    wandb: false
+  # Closed-loop bandit spike (caltech_like.py, replay.py, bandit.py). Values are assumptions
+  # unless the caltech_like module docstring marks them confirmed.
+  caltech_like:
+    frame_rate_hz: 2.0
+    n_lateral: 128
+    n_depth: 96
+    n_directions: 8
+  bandit:
+    policy: linucb
+    alpha: 1.0
+    n_trials: 200
+    seed: 0
+    gains: [1.0, 1.5, 2.0]
+    max_gain: 1.5

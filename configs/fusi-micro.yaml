@@ -1,0 +1,32 @@
+# fUSI workload, micro profile: MacBook, CPU, local Ray cluster, always distributed.
+# Same code as fusi-gpu / fusi-multinode; only this file differs.
+#   ML_CONFIG=configs/fusi-micro.yaml  (scripts/run_fusi_pipeline.py and
+#   scripts/bench_fusi_realtime.py use it by default)
+# All generated state goes to the external drive; an unmounted drive is an error
+# (ml_platform.storage), never a silent write to the internal disk.
+extends: local.yaml
+
+paths:
+  data_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/data
+  reports_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/reports
+  artifacts_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/artifacts
+  dagster_home: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/dagster_home
+  dask_temp_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/dask-tmp
+  ray_spill_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/ray-spill
+  # Ray's session dir holds AF_UNIX sockets: exFAT (the T7) cannot, and macOS caps socket
+  # paths at ~104 chars. Logs only (small); objects spill to ray_spill_dir above.
+  ray_temp_dir: ${ML_RAY_TMPDIR:-/tmp/ml-ray}
+
+tracking:
+  # MLflow db + mlartifacts/ next to it (MLFLOW_TRACKING_URI still wins)
+  tracking_uri: sqlite:///${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/mlflow/mlflow.db
+
+fusi:
+  training:
+    num_workers: 2            # Ray Train DDP (gloo) workers on the Mac; 1..4 give equal results
+    strategy: ddp
+  serve:
+    num_replicas: 2
+  telemetry:
+    exporter: file
+    file_dir: ${ML_STORAGE_ROOT:-/Volumes/T7/ml-platform-data}/otel

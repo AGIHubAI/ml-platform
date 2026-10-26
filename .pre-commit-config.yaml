@@ -1,0 +1,63 @@
+# pre-commit hooks. Install once:  uv run pre-commit install
+# Run on everything:               uv run pre-commit run --all-files
+#
+# ruff and mypy run through `uv run` (language: system) so the hook uses the
+# exact versions pinned in uv.lock -- the same ones CI and `make lint` use --
+# instead of a second, independently pinned copy.
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # k8s manifests / compose use multi-document files and anchors.
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+        exclude: ^uv\.lock$
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: debug-statements
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (lint, autofix)
+        entry: uv run ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: mypy
+        name: mypy (src/ml_platform)
+        # Configured via [tool.mypy] in pyproject.toml (packages = ml_platform);
+        # runs on the whole package, not just staged files, so cross-module
+        # type errors are caught.
+        entry: uv run mypy
+        language: system
+        types: [python]
+        files: ^src/
+        pass_filenames: false
+        require_serial: true
+
+      - id: uv-lock-check
+        name: uv lock is up to date
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false

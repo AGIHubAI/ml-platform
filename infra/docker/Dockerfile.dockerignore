@@ -1,0 +1,22 @@
+# BuildKit picks up <Dockerfile>.dockerignore next to the Dockerfile, so this
+# applies to `docker build -f infra/docker/Dockerfile .` and to compose builds.
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.ipynb_checkpoints
+.env
+data
+reports
+artifacts
+mlruns
+mlartifacts
+mlflow.db
+.dagster_home
+dagster_home
+notebooks
+tests
+docs

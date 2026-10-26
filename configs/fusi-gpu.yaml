@@ -1,0 +1,46 @@
+# fUSI workload, gpu profile: one machine with N CUDA GPUs. Not run in this repo's CI.
+# Same code as fusi-micro; only this file differs.
+#   ML_CONFIG=configs/fusi-gpu.yaml uv run python scripts/run_fusi_pipeline.py
+# Ray Train places one worker per GPU (select_resources caps num_workers at the GPU
+# count); each worker trains on ray.train.torch.get_device(), DDP over NCCL.
+# Sizes below are estimates, not measured on a GPU.
+extends: local.yaml
+
+paths:
+  data_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/data
+  reports_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/reports
+  artifacts_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/artifacts
+  dagster_home: ${ML_STORAGE_ROOT:-/data/ml-platform}/dagster_home
+  dask_temp_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/dask-tmp
+  ray_spill_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/ray-spill
+  ray_temp_dir: ${ML_RAY_TMPDIR:-/tmp/ml-ray}
+
+tracking:
+  tracking_uri: sqlite:///${ML_STORAGE_ROOT:-/data/ml-platform}/mlflow/mlflow.db
+
+distributed:
+  use_gpu: true
+  cpus_per_worker: 4
+
+fusi:
+  sessions:
+    n_subjects: 4
+    sessions_per_subject: 12
+    grid: [32, 32, 32]
+  decoder:
+    kind: transformer
+    patch: 8
+    d_model: 512              # 43.4M parameters at 32^3 (counted with build_decoder)
+    n_heads: 8
+    n_layers: 8
+    dropout: 0.1
+  training:
+    epochs: 30
+    batch_size: 64            # global; each rank gets batch_size / num_workers
+    num_workers: 8            # capped at the GPU count
+    strategy: ddp
+  serve:
+    num_replicas: 2
+  telemetry:
+    exporter: file
+    file_dir: ${ML_STORAGE_ROOT:-/data/ml-platform}/otel

@@ -1,0 +1,97 @@
+[project]
+name = "ml-platform"
+version = "0.1.0"
+description = "Local-first ML platform demo: Dagster + Ray + PyTorch DDP + MLflow + Ray Serve over a synthetic closed-loop scientific optimization task."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.5",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=16",
+    "pydantic>=2.7",
+    "pyyaml>=6",
+    "structlog>=24",
+    "ray[default,train,serve]>=2.40",
+    "dagster>=1.9",
+    "dagster-webserver>=1.9",
+    "mlflow>=2.18",
+    "httpx>=0.27",
+    "scipy>=1.13",
+    "dask[array]>=2024.8",
+    "xarray>=2024.7",
+    "zarr>=2.18",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
+    "pandas-stubs",
+    "types-PyYAML",
+]
+notebooks = [
+    "jupyter>=1.0",
+    "nbclient>=0.10",
+    "nbformat>=5.10",
+    "ipykernel>=6.29",
+    "matplotlib>=3.9",
+    "jax[cpu]>=0.4.30",
+]
+
+[tool.uv]
+default-groups = ["dev", "notebooks"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ml_platform"]
+
+[tool.dagster]
+module_name = "ml_platform.orchestration.definitions"
+code_location_name = "ml_platform"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+# notebooks/ (the generated .ipynb files *and* their notebooks/_build/*.py
+# generators) is deliberately out of ruff's scope: the build scripts are prose
+# (markdown with σ, ×, en dashes -> RUF001/002/003) plus notebook code held in
+# string literals ruff cannot see; they are validated by *executing* them
+# (`build_XX.py --execute`, `make notebooks`). force-exclude keeps explicit-path
+# runs (editors, pre-commit, `ruff check notebooks/...`) consistent with
+# `make lint` / CI (`ruff check .`).
+extend-exclude = ["notebooks"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "RUF012"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["ml_platform"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration and not gpu'"
+markers = [
+    "integration: expensive distributed / multi-service tests (run with make test-integration)",
+    "gpu: requires a CUDA GPU (opt-in)",
+    "smoke: quick end-to-end sanity checks",
+]
+timeout = 600
+filterwarnings = ["ignore::DeprecationWarning"]

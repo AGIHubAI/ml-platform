@@ -1,0 +1,112 @@
+# Helm values sketch for the Dagster control plane (chart: dagster/dagster).
+#
+#   helm repo add dagster https://dagster-io.github.io/helm
+#   helm upgrade --install dagster dagster/dagster -n ml -f infra/k8s/dagster-values.yaml
+#
+# Dagster owns *what* runs and lineage (assets, partitions per round, retries,
+# schedules/sensors). It does not schedule GPUs: every expensive step calls the
+# KubeRay cluster through RayComputeResource, which reads RAY_ADDRESS.
+# Keys follow the upstream chart; check them against the chart version you pin.
+
+global:
+  serviceAccountName: dagster
+
+
+# ---- User code deployment (gRPC code server) -------------------------------
+dagster-user-deployments:
+  enabled: true
+  deployments:
+    - name: ml-platform
+      image:
+        repository: ghcr.io/your-org/ml-platform   # built from infra/docker/Dockerfile
+        tag: "0.1.0"
+        pullPolicy: IfNotPresent
+      dagsterApiGrpcArgs:
+        - "--module-name"
+        - "ml_platform.orchestration.definitions"
+        - "--working-directory"
+        - "/app"
+      port: 3030
+      # Shared env (anchored here, reused by webserver/daemon below).
+      env: &ml-env
+        - {name: RAY_ADDRESS, value: "ray://ml-ray-head-svc.ml.svc.cluster.local:10001"}
+        - {name: MLFLOW_TRACKING_URI, value: "http://mlflow.ml.svc.cluster.local:5000"}
+        - {name: ML_CONFIG, value: "configs/distributed.yaml"}
+      resources:
+        requests: {cpu: 250m, memory: 1Gi}
+        limits: {cpu: "1", memory: 2Gi}
+      # Control plane on stable, non-GPU, non-spot nodes.
+      nodeSelector:
+        ml.io/pool: system
+
+dagsterWebserver:
+  replicaCount: 1
+  env: *ml-env
+  nodeSelector:
+    ml.io/pool: system
+
+dagsterDaemon:
+  enabled: true
+  env: *ml-env
+  nodeSelector:
+    ml.io/pool: system
+  runCoordinator:
+    enabled: true
+    type: QueuedRunCoordinator
+    config:
+      queuedRunCoordinator:
+        maxConcurrentRuns: 4
+        # One closed-loop round at a time: rounds are sequential by design.
+        tagConcurrencyLimits:
+          - key: ml/closed-loop
+            limit: 1
+
+# Each run gets its own lightweight pod; it is a *Ray client*, not a worker —
+# the heavy lifting happens on the RayCluster's CPU/GPU worker groups.
+runLauncher:
+  type: K8sRunLauncher
+  config:
+    k8sRunLauncher:
+      envVars:
+        - "RAY_ADDRESS=ray://ml-ray-head-svc.ml.svc.cluster.local:10001"
+        - "MLFLOW_TRACKING_URI=http://mlflow.ml.svc.cluster.local:5000"
+        - "ML_CONFIG=configs/distributed.yaml"
+      # Run pods need the same shared store as the Ray workers.
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: ml-shared
+      volumeMounts:
+        - {name: shared, mountPath: /app/data, subPath: data}
+        - {name: shared, mountPath: /app/reports, subPath: reports}
+        - {name: shared, mountPath: /app/artifacts, subPath: artifacts}
+      runK8sConfig:
+        containerConfig:
+          resources:
+            requests: {cpu: 250m, memory: 1Gi}
+            limits: {cpu: "1", memory: 2Gi}
+        podSpecConfig:
+          nodeSelector:
+            ml.io/pool: system
+
+# Postgres replaces the SQLite storage used by docker compose. Use a managed
+# instance (Cloud SQL / RDS) in production: postgresql.enabled=false + external host.
+postgresql:
+  enabled: false
+  postgresqlHost: "ml-postgres.ml.svc.cluster.local"
+  postgresqlUsername: dagster
+  postgresqlDatabase: dagster
+  service:
+    port: 5432
+generatePostgresqlPasswordSecret: false   # provide secret `dagster-postgresql-secret`
+
+# Compute logs to object storage instead of pod-local disk.
+computeLogManager:
+  type: S3ComputeLogManager
+  config:
+    s3ComputeLogManager:
+      bucket: your-org-ml-dagster-logs
+      prefix: compute-logs
+
+telemetry:
+  enabled: false

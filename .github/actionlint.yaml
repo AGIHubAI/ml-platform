@@ -1,0 +1,4 @@
+# actionlint config: declare custom self-hosted runner labels used in workflows.
+self-hosted-runner:
+  labels:
+    - gpu

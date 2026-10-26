@@ -1,0 +1,229 @@
+# Local multi-container stack for the ML platform.
+#
+#   docker compose up --build                       # head + 1 CPU worker + Dagster + MLflow
+#   docker compose up --build --scale ray-worker=3  # more CPU workers
+#   docker compose --profile gpu up --build         # + a GPU worker (NVIDIA container toolkit)
+#
+# UIs: Dagster http://localhost:3000 · MLflow http://localhost:5000
+#      Ray dashboard http://localhost:8265 · Ray Serve http://localhost:8000
+#
+# Everything also runs without Docker (`make ray|dagster|mlflow`); this file
+# only reproduces the process topology in containers:
+#
+#   dagster-webserver ─┐  (Ray client, ray://ray-head:10001)
+#   dagster-daemon ────┼──────────────► ray-head ◄──── ray-worker (xN, GCS ray-head:6379)
+#                      │                   │  └─ Ray Serve HTTP proxy :8000
+#                      └──► mlflow :5000 ◄─┘  (tracking + proxied artifacts)
+#
+# Storage is intentionally local (SQLite + named volumes). Production swaps:
+#   * Dagster run/event/schedule storage: SQLite -> Postgres (see infra/docker/dagster.yaml).
+#   * MLflow backend store: sqlite:////mlflow/mlflow.db -> postgresql://user:pw@host/mlflow
+#   * MLflow artifacts: /mlflow/artifacts volume -> s3://bucket/mlflow (or gs://, or MinIO
+#     via MLFLOW_S3_ENDPOINT_URL). Keep --serve-artifacts so clients never need bucket creds.
+#   * data/, reports/, artifacts/ volumes -> object storage (S3/GCS/MinIO) or a RWX PVC,
+#     because Ray workers on different nodes must see the same round store and checkpoints
+#     (Ray Train RunConfig(storage_path="s3://...")).
+# Those services are deliberately NOT added here; see infra/k8s/README.md.
+
+name: ml-platform
+
+x-app-image: &app-image
+  image: ml-platform:dev
+  build:
+    context: .
+    dockerfile: infra/docker/Dockerfile
+
+# Shared runtime volumes: every process that reads/writes rounds, reports or
+# checkpoints must see the same paths (/app/data, /app/reports, /app/artifacts).
+x-app-volumes: &app-volumes
+  - data:/app/data
+  - reports:/app/reports
+  - artifacts:/app/artifacts
+
+x-app-env: &app-env
+  ML_CONFIG: ${ML_CONFIG:-configs/distributed.yaml}
+  MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+  PYTHONUNBUFFERED: "1"
+
+services:
+  # ---------------------------------------------------------------- Ray head
+  ray-head:
+    <<: *app-image
+    hostname: ray-head
+    command:
+      - ray
+      - start
+      - --head
+      - --port=6379
+      - --ray-client-server-port=10001
+      - --dashboard-host=0.0.0.0
+      - --dashboard-port=8265
+      - --metrics-export-port=8080
+      - --num-cpus=${RAY_HEAD_NUM_CPUS:-2}
+      - --num-gpus=0
+      - --block
+    environment:
+      <<: *app-env
+      # Bind the Ray Serve HTTP proxy to all interfaces so :8000 is reachable
+      # from the host (serve default is loopback).
+      RAY_SERVE_DEFAULT_HTTP_HOST: 0.0.0.0
+    ports:
+      - "${RAY_DASHBOARD_PORT:-8265}:8265"   # dashboard + job submission API
+      - "${RAY_CLIENT_PORT:-10001}:10001"    # Ray client (ray://localhost:10001)
+      - "${RAY_SERVE_PORT:-8000}:8000"       # Ray Serve (ml_platform.inference.serve:app)
+      - "${RAY_METRICS_PORT:-8080}:8080"     # Prometheus metrics export
+    volumes: *app-volumes
+    shm_size: ${RAY_SHM_SIZE:-2gb}          # Ray object store lives in /dev/shm
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http", "http://localhost:8265/api/gcs_healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+  # ------------------------------------------------------ Ray CPU worker(s)
+  # Scale with: docker compose up --scale ray-worker=N
+  ray-worker:
+    <<: *app-image
+    command:
+      - ray
+      - start
+      - --address=ray-head:6379
+      - --num-cpus=${RAY_WORKER_NUM_CPUS:-2}
+      - --num-gpus=0
+      - --metrics-export-port=8080
+      - --block
+    environment: *app-env
+    volumes: *app-volumes
+    shm_size: ${RAY_SHM_SIZE:-2gb}
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "process", "raylet"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      ray-head:
+        condition: service_healthy
+
+  # --------------------------------------------- Ray GPU worker (opt-in only)
+  # docker compose --profile gpu up  (requires the NVIDIA container toolkit).
+  # Mirrors the GPU worker group in infra/k8s/raycluster.yaml.
+  ray-worker-gpu:
+    <<: *app-image
+    profiles: ["gpu"]
+    command:
+      - ray
+      - start
+      - --address=ray-head:6379
+      - --num-cpus=${RAY_GPU_WORKER_NUM_CPUS:-4}
+      - --metrics-export-port=8080
+      - --block
+    environment: *app-env
+    volumes: *app-volumes
+    shm_size: ${RAY_SHM_SIZE:-2gb}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${RAY_GPU_COUNT:-1}
+              capabilities: [gpu]
+    depends_on:
+      ray-head:
+        condition: service_healthy
+
+  # ------------------------------------------------------- Dagster webserver
+  dagster-webserver:
+    <<: *app-image
+    command:
+      - dagster-webserver
+      - --host=0.0.0.0
+      - --port=3000
+      - --workspace=/opt/dagster/dagster_home/workspace.yaml
+    environment: &dagster-env
+      <<: *app-env
+      DAGSTER_HOME: /opt/dagster/dagster_home
+      # Dagster talks to the Ray cluster through the Ray client; the heavy work
+      # (Ray Train DDP, parallel eval tasks, Serve deploys) runs on ray-head/ray-worker.
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
+    ports:
+      - "${DAGSTER_PORT:-3000}:3000"
+    volumes: &dagster-volumes
+      - data:/app/data
+      - reports:/app/reports
+      - artifacts:/app/artifacts
+      - dagster_storage:/opt/dagster/storage
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http", "http://localhost:3000/server_info"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+
+  # ---------------------------------------------------------- Dagster daemon
+  # Schedules, sensors, run queue (QueuedRunCoordinator) and run monitoring.
+  dagster-daemon:
+    <<: *app-image
+    command:
+      - dagster-daemon
+      - run
+      - --workspace=/opt/dagster/dagster_home/workspace.yaml
+    environment: *dagster-env
+    volumes: *dagster-volumes
+    healthcheck:
+      test: ["CMD", "dagster-daemon", "liveness-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ MLflow
+  # Tracking server + model registry + artifact proxy (--serve-artifacts):
+  # clients log to http://mlflow:5000 and never touch the artifact store directly.
+  mlflow:
+    <<: *app-image
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      # Production: postgresql://USER:PASSWORD@HOST:5432/mlflow
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --serve-artifacts
+      # Production: s3://BUCKET/mlflow | gs://BUCKET/mlflow | s3 on MinIO (MLFLOW_S3_ENDPOINT_URL)
+      - --artifacts-destination=/mlflow/artifacts
+      # Accept the in-network service name as Host header (DNS-rebinding guard).
+      - --allowed-hosts=mlflow,mlflow:5000,localhost,localhost:*,127.0.0.1,127.0.0.1:*
+    environment:
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  data:
+  reports:
+  artifacts:
+  mlflow:
+  dagster_storage:

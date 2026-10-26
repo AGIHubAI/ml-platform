@@ -1,0 +1,21 @@
+# Local Dagster instance ($DAGSTER_HOME=./dagster_home, set by the Makefile and
+# scripts/run_closed_loop.py). Run/event/schedule storage defaults to SQLite
+# files under this directory (history/, storage/, schedules/ — git-ignored and
+# wiped by `run_closed_loop.py --fresh`; this file is kept).
+# Production: point run_storage/event_log_storage/schedule_storage at Postgres
+# (see infra/docker/dagster.yaml) and use a queued run coordinator + daemon.
+
+telemetry:
+  enabled: false
+
+nux:
+  enabled: false
+
+# Code location startup imports torch + Ray + MLflow; allow a slow first import.
+code_servers:
+  local_startup_timeout: 180
+
+# At most one closed-loop run at a time on a laptop: runs share one local Ray
+# cluster's CPUs and write the next round of the same RoundStore.
+run_queue:
+  max_concurrent_runs: 1

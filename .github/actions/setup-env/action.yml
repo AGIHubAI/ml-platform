@@ -1,0 +1,37 @@
+name: Set up Python + uv environment
+description: >
+  Install uv, Python 3.12 and the locked environment (uv sync --frozen).
+  On Linux the PyPI torch wheel pulls the nvidia-* CUDA runtime wheels
+  (several GB) even though CI runs CPU-only; the lock is authoritative, so we
+  free runner disk instead of changing the resolution.
+
+inputs:
+  sync-args:
+    description: Extra arguments for `uv sync --frozen` (e.g. --only-dev).
+    required: false
+    default: ""
+  free-disk:
+    description: Remove unused preinstalled toolchains to make room for torch + CUDA wheels.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Free runner disk space
+      if: inputs.free-disk == 'true' && runner.os == 'Linux' && runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+        df -h /
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+        python-version: "3.12"
+
+    - name: Sync locked environment
+      shell: bash
+      run: uv sync --frozen ${{ inputs.sync-args }}

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run-integration:
+        description: Run integration/GPU tests on the self-hosted GPU runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  PYTHONUNBUFFERED: "1"
+  MLFLOW_DISABLE_AGENT_HINT: "1"
+  # Keep Ray from trying to reach a dashboard/usage endpoint on CI.
+  RAY_USAGE_STATS_ENABLED: "0"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+        with:
+          # ruff only needs the dev group, not torch/ray.
+          sync-args: --only-dev
+          free-disk: "false"
+      - name: ruff check
+        run: uv run --no-sync ruff check --output-format=github .
+      - name: ruff format --check
+        run: uv run --no-sync ruff format --check .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+      - name: mypy
+        run: uv run mypy
+
+  unit-tests:
+    name: Unit tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+      - name: pytest
+        # pyproject addopts already deselect `integration` and `gpu`.
+        run: uv run pytest
+
+  ray-smoke:
+    name: Ray smoke test (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+      - name: pytest -m smoke
+        # Exit code 5 = "no tests collected"; tolerated until smoke tests land.
+        run: uv run pytest -m smoke || [ $? -eq 5 ]
+
+  dagster-validate:
+    name: Dagster definitions validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+      - name: dagster definitions validate
+        run: |
+          export DAGSTER_HOME="$RUNNER_TEMP/dagster_home"
+          mkdir -p "$DAGSTER_HOME"
+          uv run dagster definitions validate -m ml_platform.orchestration.definitions
+
+  # Opt-in only: never runs on pull_request / push. Trigger from the Actions
+  # tab ("Run workflow", tick run-integration). Needs a self-hosted runner
+  # registered with the labels below (NVIDIA driver + CUDA available).
+  integration-gpu:
+    name: Integration + GPU tests (self-hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.run-integration
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-env
+        with:
+          free-disk: "false"
+      - name: nvidia-smi
+        run: nvidia-smi || echo "no nvidia-smi on this runner"
+      - name: pytest -m integration
+        run: uv run pytest -m integration
+      - name: pytest -m gpu
+        # Tolerate "no tests collected" until GPU-marked tests exist.
+        run: uv run pytest -m gpu || [ $? -eq 5 ]

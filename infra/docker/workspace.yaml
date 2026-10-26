@@ -1,0 +1,7 @@
+# Dagster workspace for the Docker Compose stack. Mirrors [tool.dagster] in
+# pyproject.toml so local `dagster dev` and the containers load the same code.
+load_from:
+  - python_module:
+      module_name: ml_platform.orchestration.definitions
+      location_name: ml_platform
+      working_directory: /app

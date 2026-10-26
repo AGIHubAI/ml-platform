@@ -1,0 +1,7 @@
+# Multi-worker CPU training via Ray Train + DDP (2 worker processes).
+extends: local.yaml
+
+distributed:
+  num_workers: 2
+  use_gpu: false
+  cpus_per_worker: 1

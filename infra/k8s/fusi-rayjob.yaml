@@ -1,0 +1,94 @@
+# KubeRay RayJob: the fUSI batch pipeline (simulate -> Zarr -> preprocess -> train ->
+# evaluate -> gate -> register) on an ephemeral GPU cluster. Configuration only: not
+# applied by this repo's CI or demos.
+#
+#   kubectl -n ml apply -f infra/k8s/fusi-rayjob.yaml
+#   kubectl -n ml get rayjob fusi-train -w
+#
+# The entrypoint is the script `make fusi-pipeline` runs on a Mac; only the profile
+# differs (configs/fusi-multinode.yaml: 16 Ray Train workers, FSDP2, OTLP traces).
+# 4 worker pods x 4 GPUs = 16 workers; select_resources caps num_workers at the GPUs
+# Ray sees, so a smaller group still runs (with fewer ranks, same global batch).
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: fusi-train
+  namespace: ml
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+    app.kubernetes.io/component: fusi-train
+spec:
+  entrypoint: python scripts/run_fusi_pipeline.py --config configs/fusi-multinode.yaml
+  runtimeEnvYAML: |
+    env_vars:
+      ML_CONFIG: configs/fusi-multinode.yaml
+      ML_STORAGE_ROOT: /mnt/ml
+      MLFLOW_TRACKING_URI: http://mlflow.ml.svc:5000
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.ml.svc:4318/v1/traces
+      NCCL_DEBUG: WARN
+  submissionMode: K8sJobMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 14400
+  backoffLimit: 0
+  rayClusterSpec:
+    rayVersion: "2.58.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"               # driver + Dagster-free pipeline steps only
+        dashboard-host: "0.0.0.0"
+        metrics-export-port: "8080"
+      template:
+        spec:
+          nodeSelector:
+            ml.io/pool: system
+          containers:
+            - name: ray-head
+              image: ghcr.io/your-org/ml-platform:0.1.0
+              ports:
+                - {containerPort: 6379, name: gcs-server}
+                - {containerPort: 8265, name: dashboard}
+                - {containerPort: 10001, name: client}
+                - {containerPort: 8080, name: metrics}
+              resources:
+                requests: {cpu: "4", memory: 16Gi}
+                limits: {cpu: "4", memory: 16Gi}
+              volumeMounts:
+                - {name: shared, mountPath: /mnt/ml}
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: ml-shared
+    workerGroupSpecs:
+      - groupName: gpu-train
+        replicas: 4
+        minReplicas: 4
+        maxReplicas: 4
+        rayStartParams:
+          metrics-export-port: "8080"
+          # num-gpus is auto-detected from the nvidia.com/gpu limit
+        template:
+          spec:
+            nodeSelector:
+              ml.io/pool: gpu
+            tolerations:
+              - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+            containers:
+              - name: ray-worker
+                image: ghcr.io/your-org/ml-platform:0.1.0
+                ports:
+                  - {containerPort: 8080, name: metrics}
+                resources:
+                  # fusi-gpu.yaml: cpus_per_worker 4 -> 4 GPUs need 16 CPUs (+ headroom)
+                  requests: {cpu: "20", memory: 128Gi, nvidia.com/gpu: 4}
+                  limits: {cpu: "20", memory: 128Gi, nvidia.com/gpu: 4}
+                volumeMounts:
+                  - {name: shared, mountPath: /mnt/ml}
+                  - {name: dshm, mountPath: /dev/shm}   # NCCL + DataLoader shared memory
+            volumes:
+              - name: shared
+                persistentVolumeClaim:
+                  claimName: ml-shared
+              - name: dshm
+                emptyDir: {medium: Memory, sizeLimit: 16Gi}

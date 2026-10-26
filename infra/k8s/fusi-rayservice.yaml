@@ -1,0 +1,93 @@
+# KubeRay RayService: the fUSI decoder behind Ray Serve. Configuration only: not
+# applied by this repo's CI or demos.
+#
+#   kubectl -n ml apply -f infra/k8s/fusi-rayservice.yaml
+#
+# The application is the same deployment the Mac runs with `deploy_decoder`
+# (serve_decoder.py), built by `app_builder`. No HTTP route: callers use a
+# DeploymentHandle from inside the cluster (the real-time loop is not an HTTP client).
+# ML_FUSI_CHECKPOINT points at the checkpoint directory of the registered
+# `production` version on the shared volume; resolve it from the MLflow registry
+# (tracking/fusi.py) before applying. Bumping MODEL_ROLLOUT rolls the replicas in place.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: fusi-serve
+  namespace: ml
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+    app.kubernetes.io/component: fusi-serve
+spec:
+  serveConfigV2: |
+    proxy_location: Disabled
+    applications:
+      - name: fusi_decoder
+        import_path: ml_platform.workloads.fusi_realtime.serve_decoder:app_builder
+        args:
+          config: configs/fusi-multinode.yaml
+        runtime_env:
+          env_vars:
+            ML_STORAGE_ROOT: /mnt/ml
+            ML_FUSI_CHECKPOINT: /mnt/ml/artifacts/fusi/production
+            MLFLOW_TRACKING_URI: http://mlflow.ml.svc:5000
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.ml.svc:4318/v1/traces
+            MODEL_ROLLOUT: "1"
+        deployments:
+          - name: FusiDecoder
+            num_replicas: 4               # fusi.serve.num_replicas
+            ray_actor_options: {num_cpus: 2, num_gpus: 0}
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"
+        dashboard-host: "0.0.0.0"
+        metrics-export-port: "8080"
+      template:
+        spec:
+          nodeSelector:
+            ml.io/pool: system
+          containers:
+            - name: ray-head
+              image: ghcr.io/your-org/ml-platform:0.1.0
+              ports:
+                - {containerPort: 6379, name: gcs-server}
+                - {containerPort: 8265, name: dashboard}
+                - {containerPort: 10001, name: client}
+                - {containerPort: 8080, name: metrics}
+              resources:
+                requests: {cpu: "2", memory: 8Gi}
+                limits: {cpu: "2", memory: 8Gi}
+              volumeMounts:
+                - {name: shared, mountPath: /mnt/ml, readOnly: true}
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: ml-shared
+    workerGroupSpecs:
+      # latency-sensitive: on-demand nodes only
+      - groupName: fusi-serve-cpu
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        rayStartParams:
+          metrics-export-port: "8080"
+        template:
+          spec:
+            nodeSelector:
+              ml.io/pool: cpu-ondemand
+            containers:
+              - name: ray-worker
+                image: ghcr.io/your-org/ml-platform:0.1.0
+                ports:
+                  - {containerPort: 8080, name: metrics}
+                resources:
+                  requests: {cpu: "4", memory: 8Gi}
+                  limits: {cpu: "4", memory: 8Gi}
+                volumeMounts:
+                  - {name: shared, mountPath: /mnt/ml, readOnly: true}
+            volumes:
+              - name: shared
+                persistentVolumeClaim:
+                  claimName: ml-shared

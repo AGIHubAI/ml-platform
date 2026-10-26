@@ -1,0 +1,18 @@
+# fUSI workload on shared CPU CI runners: small sessions, looser latency budget
+# (CI is not the reference machine; the 130 ms gate applies to the reference machine).
+extends: local.yaml
+
+fusi:
+  sessions:
+    sessions_per_subject: 4
+    session_s: 40.0
+    grid: [8, 8, 8]
+  decoder:
+    patch: 4
+  training:
+    epochs: 2
+  realtime:
+    seconds: 5.0
+  gates:
+    p99_budget_ms: 400.0
+    max_drop_fraction: 0.05

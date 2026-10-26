@@ -1,0 +1,104 @@
+# KubeRay RayJob: one-shot distributed training on an ephemeral Ray cluster.
+#
+#   kubectl -n ml apply -f infra/k8s/rayjob.yaml
+#   kubectl -n ml get rayjob ml-train -w
+#
+# The entrypoint is the same script used locally (`make train`); inside it,
+# ml_platform.training.distributed.train_distributed() builds a Ray Train
+# TorchTrainer. Ray decides where the N workers run (these pods); PyTorch DDP
+# decides how their gradients synchronize.
+#
+# Alternative: to submit onto the long-lived cluster from raycluster.yaml
+# instead of creating one, replace `rayClusterSpec` with
+#   clusterSelector:
+#     ray.io/cluster: ml-ray
+# In the platform, Dagster usually submits via the Ray client / Job API; a
+# RayJob is the right shape for ad-hoc sweeps and CI-triggered retraining.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: ml-train
+  namespace: ml
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  entrypoint: python scripts/run_training.py --config configs/distributed.yaml
+  # No working_dir: the code is baked into the image (/app, installed in the
+  # venv), so nothing is uploaded at submit time.
+  runtimeEnvYAML: |
+    env_vars:
+      ML_CONFIG: configs/distributed.yaml
+      MLFLOW_TRACKING_URI: http://mlflow.ml.svc:5000
+  # K8sJobMode: a submitter pod runs `ray job submit` and tails logs.
+  submissionMode: K8sJobMode
+  # Tear the cluster down when the job ends; keep it 10 min for log inspection.
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 7200
+  # Retries the *whole job* on a fresh cluster. Epoch-level recovery is handled
+  # inside Ray Train (FailureConfig + checkpoint restore), which is cheaper.
+  backoffLimit: 1
+  rayClusterSpec:
+    rayVersion: "2.58.0"
+    enableInTreeAutoscaling: false   # fixed-size: exactly the workers the trainer asks for
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"
+        dashboard-host: "0.0.0.0"
+        metrics-export-port: "8080"
+      template:
+        spec:
+          nodeSelector:
+            ml.io/pool: system
+          containers:
+            - name: ray-head
+              image: ghcr.io/your-org/ml-platform:0.1.0
+              ports:
+                - {containerPort: 6379, name: gcs-server}
+                - {containerPort: 8265, name: dashboard}
+                - {containerPort: 10001, name: client}
+                - {containerPort: 8080, name: metrics}
+              resources:
+                requests: {cpu: "1", memory: 4Gi}
+                limits: {cpu: "1", memory: 4Gi}
+              volumeMounts:
+                - {name: shared, mountPath: /app/data, subPath: data}
+                - {name: shared, mountPath: /app/reports, subPath: reports}
+                - {name: shared, mountPath: /app/artifacts, subPath: artifacts}
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: ml-shared
+    workerGroupSpecs:
+      # configs/distributed.yaml -> distributed.num_workers: 2 (CPU DDP).
+      # For GPU DDP use configs/gpu.yaml and a group like the `gpu` group in
+      # raycluster.yaml (nvidia.com/gpu limits + GPU nodeSelector/tolerations).
+      - groupName: train
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        rayStartParams:
+          metrics-export-port: "8080"
+        template:
+          spec:
+            nodeSelector:
+              ml.io/pool: cpu
+            containers:
+              - name: ray-worker
+                image: ghcr.io/your-org/ml-platform:0.1.0
+                ports:
+                  - {containerPort: 8080, name: metrics}
+                resources:
+                  requests: {cpu: "2", memory: 8Gi}
+                  limits: {cpu: "2", memory: 8Gi}
+                volumeMounts:
+                  - {name: shared, mountPath: /app/data, subPath: data}
+                  - {name: shared, mountPath: /app/reports, subPath: reports}
+                  - {name: shared, mountPath: /app/artifacts, subPath: artifacts}
+                  - {name: dshm, mountPath: /dev/shm}
+            volumes:
+              - name: shared
+                persistentVolumeClaim:
+                  claimName: ml-shared
+              - name: dshm
+                emptyDir: {medium: Memory, sizeLimit: 2Gi}

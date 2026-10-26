@@ -1,0 +1,37 @@
+# fUSI workload, multinode profile: KubeRay cluster (infra/k8s/fusi-rayjob.yaml,
+# fusi-rayservice.yaml). Not run in this repo's CI; configuration only.
+# Same code as fusi-micro / fusi-gpu; only this file differs.
+# Shared state lives on the RWX volume mounted at /mnt/ml (PVC ml-shared); MLflow and
+# the OTel collector are cluster services. Sizes are estimates, not measured.
+extends: fusi-gpu.yaml
+
+paths:
+  data_dir: ${ML_STORAGE_ROOT:-/mnt/ml}/data
+  reports_dir: ${ML_STORAGE_ROOT:-/mnt/ml}/reports
+  artifacts_dir: ${ML_STORAGE_ROOT:-/mnt/ml}/artifacts
+  dagster_home: ${ML_STORAGE_ROOT:-/mnt/ml}/dagster_home
+  dask_temp_dir: /tmp/dask              # node-local scratch
+  ray_spill_dir: /tmp/ray-spill         # node-local scratch
+  ray_temp_dir: /tmp/ray
+
+tracking:
+  tracking_uri: ${MLFLOW_TRACKING_URI:-http://mlflow.ml.svc:5000}
+
+fusi:
+  sessions:
+    n_subjects: 8
+    sessions_per_subject: 24
+    grid: [64, 64, 64]
+  decoder:
+    d_model: 512              # 161M parameters at 64^3 (counted with build_decoder)
+    n_heads: 8
+    n_layers: 8
+  training:
+    batch_size: 256
+    num_workers: 16           # 4 nodes x 4 GPUs (fusi-rayjob.yaml)
+    strategy: fsdp2           # shard parameters + optimizer state across ranks
+  serve:
+    num_replicas: 4
+  telemetry:
+    exporter: otlp
+    otlp_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector.ml.svc:4318/v1/traces}
